@@ -1,240 +1,326 @@
-"""A small, self-contained demo of the pg-widgets library.
+"""Fish picking demo GUI.
 
-Run with ``python main.py``.  Slide the vertical sliders to change the
-amplitude, frequency and noise of the plotted signal, use the colour picker to
-change the line colour, and use the buttons/toggle to pause, clear, take a
-screenshot or show a second trace.
-
-The tabs at the bottom right of the left panel switch between the live plot and
-the image view.  The image tab shows a placeholder until Vision.py supplies
-frames; call ``image_view.setImage(surface)`` to display a real image.
+Top left: camera feed from Vision (60% width, aspect ratio preserved).
+Below that: AI detection stats (position relative to center, size; handles no-detection).
+Right side: communication interface to send and read arbitrary variables, plus sliders for g_diffX/Y/Z.
 """
-
-import math
-import random
 
 import pygame as pg
 import pg_widgets as pw
+import numpy as np
+import time
 
 from ImageView import ImageView
+from Vision import Vision
+from Communication import ThreadedRobotClient
 
 
-def _make_placeholder(size: tuple[int, int] = (640, 480)) -> pg.Surface:
-    """Return a simple 4:3 test image so the Vision tab is not empty."""
-    surface = pg.Surface(size)
-    surface.fill((28, 32, 38))
-
-    for x in range(0, size[0], 40):
-        pg.draw.line(surface, (42, 50, 60), (x, 0), (x, size[1]))
-    for y in range(0, size[1], 40):
-        pg.draw.line(surface, (42, 50, 60), (0, y), (size[0], y))
-
-    centre = (size[0] // 2, size[1] // 2)
-    pg.draw.circle(surface, (0, 200, 180), centre, 90, 3)
-    pg.draw.line(
-        surface,
-        (0, 200, 180),
-        (centre[0] - 130, centre[1]),
-        (centre[0] + 130, centre[1]),
-        2,
-    )
-    pg.draw.line(
-        surface,
-        (0, 200, 180),
-        (centre[0], centre[1] - 130),
-        (centre[0], centre[1] + 130),
-        2,
-    )
-
-    font = pg.font.SysFont("Arial", 28)
-    text = font.render("Vision feed (placeholder)", True, (200, 210, 220))
-    surface.blit(text, ((size[0] - text.get_width()) // 2, size[1] - 54))
+def _numpy_bgr_to_surface(frame: np.ndarray) -> pg.Surface:
+    """Convert BGR numpy frame (from OpenCV) to pygame Surface."""
+    rgb = frame[:, :, ::-1]
+    surface = pg.surfarray.make_surface(rgb.swapaxes(0, 1))
     return surface
 
 
 def main() -> None:
     control = pw.ControlManager()
 
-    # ----- Left side: live plot and vision feed in tabs --------------------
-    signal_tab = pw.UIGroup((0.0, 0.0), (1.0, 0.95))
-    vision_tab = pw.UIGroup((0.0, 0.0), (1.0, 0.95))
+    # Start vision system
+    vision = Vision(annotate=True)
+    try:
+        vision.start()
+    except Exception as e:
+        print(f"Warning: Could not start Vision: {e}")
+        vision = None
 
-    plot = pw.Plot((0.02, 0.02), (0.96, 0.96))
-    plot.setTitle("Live signal")
-    plot.setXLabel("time [s]")
-    plot.setYLabel("amplitude")
-    plot.setBounds(x_low=0.0, x_high=8.0, y_low=-1.5, y_high=1.5)
-    plot.setColor("textColor", (225, 225, 225))
-    plot.setColor("plot1", (0, 220, 255))
-    signal_tab["plot"] = plot
+    # Start robot communication (non-blocking for GUI)
+    robot = None
+    try:
+        robot = ThreadedRobotClient()
+        robot.start()
+        print("Robot communication started")
+    except Exception as e:
+        print(f"Warning: Could not start robot communication: {e}")
+        robot = None
 
+    # ----- Left side: Camera feed (60% width) and stats below -----
+    # Camera feed takes top portion of left side
+    camera_group = pw.UIGroup((0.0, 0.0), (0.6, 0.7))
     image_view = ImageView((0.02, 0.02), (0.96, 0.96))
-    image_view.setImage(_make_placeholder())
-    # Replace the placeholder when Vision is ready, e.g.:
-    # image_view.setImage(surface_from_vision)
-    vision_tab["image"] = image_view
+    camera_group["image"] = image_view
 
-    tabs = pw.Tab(
-        (0.02, 0.04),
-        (0.63, 0.79),
-        uiElements=[vision_tab, signal_tab],
-        names=["Vision", "Plot"],
+    control["camera"] = camera_group
+
+    # Stats below camera feed
+    stats_group = pw.UIGroup((0.0, 0.72), (0.6, 0.26))
+    stats_label = pw.TextBoxes((0.02, 0.05), (0.96, 0.9), labels=[
+        "Status: Initializing...",
+        "Position rel. center: --",
+        "Size (W x H): --",
+        "Area: --",
+        "Confidence: --",
+    ])
+    stats_label.setAlignments(horizontal=pw.TextBox.AlignmentHorizontal.LEFT)
+    stats_group["stats"] = stats_label
+    control["stats"] = stats_group
+
+    # ----- Right side: Communication interface -----
+    comm_group = pw.UIGroup((0.62, 0.0), (0.36, 1.0))
+
+    # Diff sliders section
+    diff_label = pw.TextBox((0.02, 0.01), (0.96, 0.05))
+    diff_label.setText("Diff Control (g_diffX/Y/Z)")
+    diff_label.setAlignment(horizontal=pw.TextBox.AlignmentHorizontal.LEFT)
+    diff_label.disableSelection()
+    comm_group["diffLabel"] = diff_label
+
+    diff_sliders = pw.TuningSliders(
+        (0.02, 0.07),
+        (0.96, 0.22),
+        labels=["g_diffX", "g_diffY", "g_diffZ"],
+        lower_bounds=[-250.0, -250.0, -250.0],
+        upper_bounds=[250.0, 250.0, 250.0],
+        current_values=[0.0, 0.0, 0.0],
     )
-    control["tabs"] = tabs
+    for label in ("g_diffX", "g_diffY", "g_diffZ"):
+        diff_sliders[f"value{label}"].disableSelection()
+        diff_sliders[f"text{label}"].disableSelection()
+    comm_group["diffSliders"] = diff_sliders
 
-    # ----- Sliders that drive the signal -----------------------------------
-    sliders = pw.TuningSliders(
-        (0.67, 0.04),
-        (0.31, 0.38),
-        labels=["Amp", "Freq", "Noise"],
-        lower_bounds=[0.0, 0.2, 0.0],
-        upper_bounds=[1.2, 3.0, 0.3],
-        current_values=[0.8, 0.8, 0.05],
-    )
-    # Keep the value boxes read-only; the sliders themselves remain usable.
-    for label in ("Amp", "Freq", "Noise"):
-        sliders[f"value{label}"].disableSelection()
-        sliders[f"text{label}"].disableSelection()
-    control["sliders"] = sliders
+    # Write section
+    write_label = pw.TextBox((0.02, 0.31), (0.96, 0.05))
+    write_label.setText("WRITE")
+    write_label.setAlignment(horizontal=pw.TextBox.AlignmentHorizontal.LEFT)
+    write_label.disableSelection()
+    comm_group["writeLabel"] = write_label
 
-    # ----- Buttons ---------------------------------------------------------
-    pause_button = pw.Button((0.67, 0.44), (0.097, 0.07))
-    pause_button.setText("Pause")
+    # Variable name input
+    name_label = pw.TextBox((0.02, 0.37), (0.96, 0.05))
+    name_label.setText("Variable Name:")
+    name_label.setAlignment(horizontal=pw.TextBox.AlignmentHorizontal.LEFT)
+    name_label.disableSelection()
+    comm_group["nameLabel"] = name_label
 
-    clear_button = pw.Button((0.777, 0.44), (0.097, 0.07))
-    clear_button.setText("Clear")
+    var_name_input = pw.TextBox((0.02, 0.43), (0.96, 0.07))
+    var_name_input.setText("g_testVar")
+    var_name_input.setAlignment(horizontal=pw.TextBox.AlignmentHorizontal.LEFT)
+    comm_group["varName"] = var_name_input
 
-    snapshot_button = pw.Button((0.884, 0.44), (0.097, 0.07))
-    snapshot_button.setText("Snapshot")
+    # Variable value input
+    value_label = pw.TextBox((0.02, 0.51), (0.96, 0.05))
+    value_label.setText("Variable Value:")
+    value_label.setAlignment(horizontal=pw.TextBox.AlignmentHorizontal.LEFT)
+    value_label.disableSelection()
+    comm_group["valueLabel"] = value_label
 
-    control["pauseButton"] = pause_button
-    control["clearButton"] = clear_button
-    control["snapshotButton"] = snapshot_button
+    var_value_input = pw.TextBox((0.02, 0.57), (0.96, 0.07))
+    var_value_input.setText("0")
+    var_value_input.setAlignment(horizontal=pw.TextBox.AlignmentHorizontal.LEFT)
+    comm_group["varValue"] = var_value_input
 
-    # ----- Toggle for the second trace -------------------------------------
-    trace_label = pw.TextBox((0.67, 0.515), (0.20, 0.05))
-    trace_label.setText("Second trace")
-    trace_label.disableSelection()
-    control["traceLabel"] = trace_label
+    # Send button
+    send_button = pw.Button((0.02, 0.65), (0.96, 0.08))
+    send_button.setText("Send")
 
-    show_second = pw.ToggleButton((0.89, 0.515), (0.09, 0.05))
-    # UIElement.__new__ only forwards its own border keywords, so subclass
-    # keywords such as ``state=True`` cannot be passed to the constructor.
-    show_second.setValue(True)
-    control["showSecond"] = show_second
+    # Callback setup
+    def send_callback(variable=None):
+        var_name = var_name_input.getText()
+        var_value = var_value_input.getText()
+        print(f"Send requested: {var_name} = {var_value}")
+        if robot is not None:
+            try:
+                # Try to convert to appropriate type
+                try:
+                    if '.' in var_value or 'e' in var_value.lower():
+                        val = float(var_value)
+                    else:
+                        val = int(var_value)
+                except ValueError:
+                    if var_value.lower() in ('true', 'false'):
+                        val = var_value.lower() == 'true'
+                    else:
+                        val = var_value
+                robot.write(var_name, val)
+                print(f"Sent via robot: {var_name} = {val}")
+            except Exception as e:
+                print(f"Error sending: {e}")
+        else:
+            print("Robot not connected")
 
-    # ----- Colour picker for the main trace --------------------------------
-    picker = pw.ColorPicker((0.67, 0.57), (0.31, 0.17))
-    picker["sliderHue"].setValue(0.33)
-    picker["sliderSat"].setValue(0.75)
-    picker["sliderVal"].setValue(1.0)
-    for name in ("Hue", "Sat", "Val"):
-        picker[f"text{name}"].disableSelection()
-    control["picker"] = picker
+    try:
+        send_button.setFunction(send_callback)
+        send_button.setVariable(None)
+    except Exception:
+        pass
 
-    # ----- Buffer / status readouts ----------------------------------------
-    progress = pw.ProgressBar((0.67, 0.75), (0.31, 0.035))
-    control["progress"] = progress
+    try:
+        send_button.overrideOnLeftClick(send_callback)
+    except Exception:
+        pass
 
-    status = pw.TextBoxes(
-        (0.67, 0.79),
-        (0.31, 0.19),
-        labels=["time", "render", "samples", "last"],
-    )
-    control["status"] = status
+    comm_group["sendButton"] = send_button
 
-    # ----- Demo state and callbacks ----------------------------------------
-    MAX_POINTS = 600
-    WINDOW = 8.0
+    # Read section
+    read_label = pw.TextBox((0.02, 0.75), (0.96, 0.05))
+    read_label.setText("READ")
+    read_label.setAlignment(horizontal=pw.TextBox.AlignmentHorizontal.LEFT)
+    read_label.disableSelection()
+    comm_group["readLabel"] = read_label
 
-    paused = False
-    sim_time = 0.0
-    samples = 0
-    last_action = "ready"
-    was_showing_second = False
-    last_color = None
+    read_name_label = pw.TextBox((0.02, 0.81), (0.96, 0.05))
+    read_name_label.setText("Variable Name:")
+    read_name_label.setAlignment(horizontal=pw.TextBox.AlignmentHorizontal.LEFT)
+    read_name_label.disableSelection()
+    comm_group["readNameLabel"] = read_name_label
+
+    read_var_name_input = pw.TextBox((0.02, 0.87), (0.96, 0.07))
+    read_var_name_input.setText("g_testFloat")
+    read_var_name_input.setAlignment(horizontal=pw.TextBox.AlignmentHorizontal.LEFT)
+    comm_group["readVarName"] = read_var_name_input
+
+    read_button = pw.Button((0.02, 0.95), (0.47, 0.04))
+    read_button.setText("Read")
+
+    read_value_display = pw.TextBox((0.51, 0.95), (0.47, 0.04))
+    read_value_display.setText("--")
+    read_value_display.setAlignment(horizontal=pw.TextBox.AlignmentHorizontal.LEFT)
+    read_value_display.disableSelection()
+    comm_group["readValueDisplay"] = read_value_display
+
+    def read_callback(variable=None):
+        var_name = read_var_name_input.getText()
+        print(f"Read requested: {var_name}")
+        if robot is not None:
+            try:
+                robot.request(var_name)
+                print(f"Requested {var_name} for polling")
+            except Exception as e:
+                print(f"Error requesting: {e}")
+        else:
+            print("Robot not connected")
+
+    try:
+        read_button.setFunction(read_callback)
+        read_button.setVariable(None)
+    except Exception:
+        pass
+
+    try:
+        read_button.overrideOnLeftClick(read_callback)
+    except Exception:
+        pass
+
+    comm_group["readButton"] = read_button
+    control["comm"] = comm_group
+
+    # Store references
+    control._var_name_input = var_name_input
+    control._var_value_input = var_value_input
+    control._send_callback = send_callback
+    control._read_var_name_input = read_var_name_input
+    control._read_value_display = read_value_display
+    control._robot = robot
+    control._diff_sliders = diff_sliders
+
+    # Timer for sending diff values
+    last_diff_send = time.time()
+    diff_send_interval = 1.0  # Send every second
+
     clock = pg.time.Clock()
 
-    def set_action(text: str) -> None:
-        nonlocal last_action
-        last_action = text
-
-    def toggle_pause() -> None:
-        nonlocal paused
-        paused = not paused
-        pause_button.setText("Resume" if paused else "Pause")
-        set_action("paused" if paused else "running")
-
-    def clear_plot() -> None:
-        nonlocal sim_time, samples
-        sim_time = 0.0
-        samples = 0
-        plot.setValue([], [], plotIx=0)
-        plot.setValue([], [], plotIx=1)
-        plot.setBounds(x_low=0.0, x_high=WINDOW)
-        set_action("plot cleared")
-
-    def take_screenshot() -> None:
-        control.screenshot()
-        set_action(f"saved frame {control.getIteration()}")
-
-    pause_button.overrideOnLeftClick(toggle_pause)
-    clear_button.overrideOnLeftClick(clear_plot)
-    snapshot_button.overrideOnLeftClick(take_screenshot)
-
-    # ----- Main loop -------------------------------------------------------
     while control.isRunning():
-        # 60 FPS keeps the time axis stable and avoids burning a CPU core.
-        dt = min(clock.tick(60) / 1000.0, 0.1)  # cap after a long stall
+        clock.tick(60)
+        current_time = time.time()
 
-        # Clear the second trace when it is switched off.
-        show_second_now = show_second.getValue()
-        if show_second_now and not was_showing_second:
-            was_showing_second = True
-        elif not show_second_now and was_showing_second:
-            plot.setValue([], [], plotIx=1)
-            was_showing_second = False
+        # Send diff values periodically
+        if robot is not None and current_time - last_diff_send >= diff_send_interval:
+            try:
+                diff_x, diff_y, diff_z = diff_sliders.getValue()
+                robot.write("g_diffX", float(diff_x))
+                robot.write("g_diffY", float(diff_y))
+                robot.write("g_diffZ", float(diff_z))
+                print(f"Sent diffs: g_diffX={diff_x:.2f}, g_diffY={diff_y:.2f}, g_diffZ={diff_z:.2f}")
+            except Exception as e:
+                print(f"Error sending diffs: {e}")
+            last_diff_send = current_time
 
-        if not paused:
-            sim_time += dt
-            amplitude, frequency, noise = sliders.getValue()
-            omega = 2.0 * math.pi * frequency
+        # Update camera feed from vision
+        if vision is not None:
+            snapshot = vision.latest()
+            if snapshot is not None:
+                frame = snapshot.annotated_frame if snapshot.annotated_frame is not None else snapshot.frame
+                if frame is not None:
+                    try:
+                        surf = _numpy_bgr_to_surface(frame)
+                        image_view.setImage(surf)
+                    except Exception:
+                        pass
 
-            first = amplitude * math.sin(omega * sim_time)
-            second = amplitude * math.cos(omega * sim_time)
-            second += noise * random.uniform(-1.0, 1.0)
+                best = snapshot.best
+                if best is None or len(snapshot.detections) == 0:
+                    stats_label.setTexts([
+                        "Status: No fish detected",
+                        "Position rel. center: --",
+                        "Size (W x H): --",
+                        "Area: --",
+                        "Confidence: --",
+                    ])
+                else:
+                    frame_h, frame_w = frame.shape[:2]
+                    center_x = frame_w / 2.0
+                    center_y = frame_h / 2.0
+                    fish_cx, fish_cy = best.center
+                    rel_x = fish_cx - center_x
+                    rel_y = fish_cy - center_y
 
-            plot.addValue(sim_time, first, plotIx=0, maxLength=MAX_POINTS)
-            if show_second_now:
-                plot.addValue(sim_time, second, plotIx=1, maxLength=MAX_POINTS)
-
-            samples = min(MAX_POINTS, samples + 1)
-            if sim_time < WINDOW:
-                plot.setBounds(x_low=0.0, x_high=WINDOW)
+                    stats_label.setTexts([
+                        f"Status: Fish detected ({len(snapshot.detections)} total)",
+                        f"Position rel. center: ({rel_x:.1f}, {rel_y:.1f}) px",
+                        f"Size (W x H): ({best.width:.1f}, {best.height:.1f}) px",
+                        f"Area: {best.area:.1f} px²",
+                        f"Confidence: {best.confidence:.3f}",
+                    ])
             else:
-                plot.setBounds(x_low=sim_time - WINDOW, x_high=sim_time)
-
-        color = tuple(picker.getValue())
-        if color != last_color:
-            plot.setColor("plot0", color)
-            last_color = color
-
-        progress.setValue(samples / MAX_POINTS)
-
-        render_time = control.getRenderTime()
-        if render_time is None or render_time < 0:
-            render_text = "render      --"
+                stats_label.setTexts([
+                    "Status: Waiting for camera...",
+                    "Position rel. center: --",
+                    "Size (W x H): --",
+                    "Area: --",
+                    "Confidence: --",
+                ])
         else:
-            render_text = f"render {render_time * 1000:6.2f} ms"
+            stats_label.setTexts([
+                "Status: Vision not available",
+                "Position rel. center: --",
+                "Size (W x H): --",
+                "Area: --",
+                "Confidence: --",
+            ])
 
-        status.setTexts([
-            f"time    {sim_time:6.2f} s",
-            render_text,
-            f"samples {samples:3d} / {MAX_POINTS}",
-            f"last    {last_action}",
-        ])
+        # Update read value display if we have robot and requested variable
+        if robot is not None:
+            try:
+                var_name = read_var_name_input.getText()
+                if var_name and robot.is_ready(var_name):
+                    val = robot.get_value(var_name)
+                    if val is not None:
+                        read_value_display.setText(str(val))
+            except Exception:
+                pass
 
         control.update()
+
+    if vision is not None:
+        try:
+            vision.stop()
+        except Exception:
+            pass
+
+    if robot is not None:
+        try:
+            robot.stop()
+        except Exception:
+            pass
 
     control.close()
 
