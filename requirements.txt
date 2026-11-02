@@ -1,0 +1,19 @@
+# Direct dependencies for the fish picking demo.
+# Versions are pinned to the set that was tested with Python 3.13 on Windows.
+#
+# Install with:
+#   python -m venv .venv
+#   .venv\Scripts\python -m pip install -r requirements.txt
+
+# GUI
+pygame==2.6.1
+# pg-widgets is installed from the newest main branch rather than the 0.1.0
+# release. This requires git on PATH. For a reproducible install, pin the
+# commit instead of the branch:
+#   pg-widgets @ git+https://github.com/IslandRock1/pg-widget.git@4f01bb13b0c6dad95bc83a22c615eff9ce644cc9
+pg-widgets @ git+https://github.com/IslandRock1/pg-widget.git@main
+
+# Vision: camera capture, frame handling and the ONNX fish detector
+numpy==2.5.4
+opencv-python==5.0.0.93
+onnxruntime==1.31.1
