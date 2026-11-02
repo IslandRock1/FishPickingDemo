@@ -1,11 +1,17 @@
 """Fish picking demo GUI.
 
-The window is split into four equally sized quadrants:
+The window has two tabs.
 
-* top left: camera feed from Vision (aspect ratio preserved)
-* top right: write and read arbitrary robot variables, four rows each
-* bottom left: detection stats (status, position, size, confidence)
-* bottom right: sliders for g_diffX, g_diffY, g_diffZ and g_diffRz
+* **Controls**: the original four-quadrant dashboard
+
+  - top left: camera feed from Vision (aspect ratio preserved)
+  - top right: write and read arbitrary robot variables, four rows each
+  - bottom left: detection stats (status, position, size, confidence)
+  - bottom right: sliders for g_diffX, g_diffY, g_diffZ and g_diffRz
+
+* **Fish**: camera feed, the fish position relative to the frame centre, a
+  preview of the g_diffX/g_diffY values that will be sent, and an Execute
+  button that runs the move handshake.
 
 Unannotated camera frames are also saved to ``training_images/`` at 5 Hz so
 they can be used to train a new model later.
@@ -26,6 +32,18 @@ from Communication import ThreadedRobotClient
 IMAGE_SAVE_DIRECTORY = Path(__file__).resolve().parent / "training_images"
 IMAGE_SAVE_INTERVAL = 0.2  # 5 images per second
 IMAGE_JPEG_QUALITY = 95
+
+# Robot variables used by the Execute handshake.
+DIFF_X_VARIABLE = "g_diffX"
+DIFF_Y_VARIABLE = "g_diffY"
+TO_COMPUTER_VARIABLE = "g_toComputer"
+TO_ROBOT_VARIABLE = "g_toRobot"
+CALIBRATION_DONE_VARIABLE = "g_calibrationDone"
+
+# Fish positions closer than this (in pixels from the frame centre) are treated
+# as already aligned and are sent as 0.
+FISH_DEADBAND_PIXELS = 10.0
+EXECUTE_WAIT_SECONDS = 1.0
 
 
 class ImageSaver:
@@ -179,11 +197,15 @@ def main():
     vision = getVision()
     robot = getRobot()
 
+    # Content of the first tab. It stops at 95% height so the tab buttons in
+    # the top-right corner do not cover any of the existing widgets.
+    mainTab = pw.UIGroup((0.0, 0.0), (1.0, 0.95))
+
     # ----- Top left: camera feed -----
     topLeft = pw.UIGroup((0.0, 0.0), (0.5, 0.5))
     imageView = ImageView((0.0, 0.0), (1.0, 1.0))
     topLeft["image"] = imageView
-    control["topLeft"] = topLeft
+    mainTab["topLeft"] = topLeft
 
     # ----- Bottom left: detection statistics -----
     botLeft = pw.UIGroup((0.0, 0.5), (0.5, 0.5))
@@ -216,7 +238,7 @@ def main():
 
     botLeft["statsLabels"] = statsLabels
     botLeft["statsValues"] = statsValues
-    control["botLeft"] = botLeft
+    mainTab["botLeft"] = botLeft
 
     # ----- Top right: write and read arbitrary variables -----
     topRight = pw.UIGroup((0.5, 0.0), (0.5, 0.5))
@@ -315,7 +337,7 @@ def main():
 
     topRight["writeVar"] = writeVar
     topRight["readVar"] = readVar
-    control["topRight"] = topRight
+    mainTab["topRight"] = topRight
 
     # ----- Bottom right: diff sliders -----
     botRight = pw.UIGroup((0.5, 0.5), (0.5, 0.5))
@@ -326,7 +348,12 @@ def main():
     diffLabel.disableSelection()
     botRight["diffLabel"] = diffLabel
 
-    diffLabels = ["g_diffX", "g_diffY", "g_diffZ", "g_diffRz"]
+    diffLabels = [
+        DIFF_X_VARIABLE,
+        DIFF_Y_VARIABLE,
+        "g_diffZ",
+        "g_diffRz",
+    ]
     diffSliders = pw.TuningSliders(
         (0.02, 0.10),
         (0.96, 0.86),
@@ -340,16 +367,159 @@ def main():
         diffSliders[f"text{label}"].disableSelection()
 
     botRight["diffSliders"] = diffSliders
-    control["botRight"] = botRight
+    mainTab["botRight"] = botRight
 
+    # ----- Second tab: fish targeting -----
+    fishTab = pw.UIGroup((0.0, 0.0), (1.0, 0.95))
+
+    fishCamera = pw.UIGroup((0.0, 0.0), (0.62, 1.0))
+    fishImageView = ImageView((0.0, 0.0), (1.0, 1.0))
+    fishCamera["image"] = fishImageView
+    fishTab["camera"] = fishCamera
+
+    fishPanel = pw.UIGroup((0.62, 0.0), (0.38, 1.0))
+
+    fishTitle = pw.TextBox((0.04, 0.02), (0.92, 0.10))
+    fishTitle.setText("Fish Targeting")
+    fishTitle.setAlignment(horizontal=pw.TextBox.AlignmentHorizontal.LEFT)
+    fishTitle.disableSelection()
+    fishPanel["title"] = fishTitle
+
+    fishStatsLabels = pw.TextBoxes(
+        (0.04, 0.14),
+        (0.48, 0.36),
+        labels=[
+            "Fish X:",
+            "Fish Y:",
+            "Send g_diffX:",
+            "Send g_diffY:",
+        ],
+    )
+    fishStatsLabels.setAlignments(
+        horizontal=pw.TextBox.AlignmentHorizontal.LEFT,
+        vertical=pw.TextBox.AlignmentVertical.MIDDLE,
+    )
+
+    fishStatsValues = pw.TextBoxes(
+        (0.52, 0.14),
+        (0.44, 0.36),
+        labels=["--", "--", "--", "--"],
+    )
+    fishStatsValues.setAlignments(
+        horizontal=pw.TextBox.AlignmentHorizontal.LEFT,
+        vertical=pw.TextBox.AlignmentVertical.MIDDLE,
+    )
+
+    for i in range(4):
+        fishStatsLabels[f"text{i}"].disableSelection()
+        fishStatsValues[f"text{i}"].disableSelection()
+
+    fishPanel["statsLabels"] = fishStatsLabels
+    fishPanel["statsValues"] = fishStatsValues
+
+    fishDeadbandLabel = pw.TextBox((0.04, 0.52), (0.92, 0.08))
+    fishDeadbandLabel.setText(
+        f"Deadband: {FISH_DEADBAND_PIXELS:.0f} px from centre"
+    )
+    fishDeadbandLabel.setAlignment(
+        horizontal=pw.TextBox.AlignmentHorizontal.LEFT
+    )
+    fishDeadbandLabel.disableSelection()
+    fishPanel["deadbandLabel"] = fishDeadbandLabel
+
+    executeButton = pw.Button((0.04, 0.63), (0.92, 0.12))
+    executeButton.setText("Execute")
+    fishPanel["executeButton"] = executeButton
+
+    calibrationLabel = pw.TextBox((0.04, 0.77), (0.64, 0.11))
+    calibrationLabel.setText("Calibration done")
+    calibrationLabel.setAlignment(
+        horizontal=pw.TextBox.AlignmentHorizontal.LEFT
+    )
+    calibrationLabel.disableSelection()
+    fishPanel["calibrationLabel"] = calibrationLabel
+
+    calibrationToggle = pw.ToggleButton((0.72, 0.77), (0.24, 0.11))
+    calibrationToggle.disableSelection()
+    fishPanel["calibrationToggle"] = calibrationToggle
+
+    executeStatus = pw.TextBox((0.04, 0.90), (0.92, 0.09))
+    executeStatus.setText("Idle")
+    executeStatus.setAlignment(horizontal=pw.TextBox.AlignmentHorizontal.LEFT)
+    executeStatus.disableSelection()
+    fishPanel["executeStatus"] = executeStatus
+
+    fishTab["panel"] = fishPanel
+
+    tabs = pw.Tab(
+        (0.0, 0.0),
+        (1.0, 1.0),
+        uiElements=[mainTab, fishTab],
+        names=["Controls", "Fish"],
+    )
+    control["tabs"] = tabs
+
+    # Values shown on the Fish tab and used by the Execute button. Updated from
+    # the newest vision snapshot in the main loop.
+    targetDiff = {"x": 0.0, "y": 0.0, "hasFish": False}
+    executionState = {"running": False, "status": "Idle"}
+
+    def executeFishMove(_=None) -> None:
+        if executionState["running"]:
+            return
+        if robot is None:
+            executionState["status"] = "Robot not connected"
+            return
+        if not targetDiff["hasFish"]:
+            executionState["status"] = "No fish detected"
+            return
+
+        diffX = float(targetDiff["x"]) * -0.5
+        diffY = float(targetDiff["y"]) *  0.5
+        executionState["running"] = True
+        executionState["status"] = f"Sending {diffX:.1f} | {diffY:.1f} ..."
+
+        def run() -> None:
+            try:
+                robot.write(DIFF_X_VARIABLE, diffX)
+                robot.write(DIFF_Y_VARIABLE, diffY)
+                print(
+                    f"Execute: {DIFF_X_VARIABLE}={diffX:.2f}, "
+                    f"{DIFF_Y_VARIABLE}={diffY:.2f}"
+                )
+
+                time.sleep(EXECUTE_WAIT_SECONDS)
+                robot.write(TO_COMPUTER_VARIABLE, 0)
+                print(f"Execute: {TO_COMPUTER_VARIABLE}=0")
+
+                time.sleep(EXECUTE_WAIT_SECONDS)
+                robot.write(TO_ROBOT_VARIABLE, 1)
+                print(f"Execute: {TO_ROBOT_VARIABLE}=1")
+                executionState["status"] = "Execute sequence sent"
+            except Exception as error:
+                executionState["status"] = f"Execute failed: {error}"
+            finally:
+                executionState["running"] = False
+
+        threading.Thread(
+            target=run,
+            name="FishExecute",
+            daemon=True,
+        ).start()
+
+    executeButton.setFunction(executeFishMove)
+
+    last_calibration_state = False
     last_diff_values: dict[str, float] = {}
     last_diff_error = None
     last_read_poll = 0.0
     read_poll_interval = 1.0
     requested_read_names: set[str] = set()
+    last_execute_status = executionState["status"]
 
     SAVE_TRAINING_IMAGES = False
-    if (SAVE_TRAINING_IMAGES):
+    imageSaver = None
+    if SAVE_TRAINING_IMAGES:
         try:
             imageSaver = ImageSaver()
             print(
@@ -359,67 +529,128 @@ def main():
         except Exception as error:
             print(f"Warning: could not start image saving: {error}")
             imageSaver = None
-        else: imageSaver = None
 
     try:
         while control.isRunning():
             now = time.monotonic()
 
             # Camera feed and detection statistics.
-            if vision is not None:
-                snapshot = vision.latest()
-                if snapshot is not None:
-                    if imageSaver is not None:
-                        imageSaver.offer(snapshot.frame, snapshot.sequence)
+            snapshot = vision.latest() if vision is not None else None
 
-                    frame = (
-                        snapshot.annotated_frame
-                        if snapshot.annotated_frame is not None
-                        else snapshot.frame
-                    )
-
-                    if frame is not None:
-                        try:
-                            imageView.setImage(_numpy_bgr_to_surface(frame))
-                        except Exception:
-                            pass
-
-                    best = snapshot.best
-                    if best is None:
-                        statsValues.setTexts([
-                            "No fish detected",
-                            "-- | --",
-                            "-- x --",
-                            "--",
-                        ])
-                    else:
-                        frameHeight, frameWidth = frame.shape[:2]
-                        centerX = frameWidth / 2.0
-                        centerY = frameHeight / 2.0
-                        fishX, fishY = best.center
-                        relativeX = fishX - centerX
-                        relativeY = fishY - centerY
-
-                        statsValues.setTexts([
-                            f"Fish detected ({len(snapshot.detections)} total)",
-                            f"{relativeX:.1f} | {relativeY:.1f}",
-                            f"{best.width:.1f} x {best.height:.1f} px",
-                            f"{best.confidence:.3f}",
-                        ])
-                else:
-                    statsValues.setTexts([
-                        "Waiting for camera",
-                        "-- | --",
-                        "-- x --",
-                        "--",
-                    ])
-            else:
+            if vision is None:
                 statsValues.setTexts([
                     "Vision not available",
                     "-- | --",
                     "-- x --",
                     "--",
                 ])
+                fishStatsValues.setTexts(["--", "--", "--", "--"])
+                targetDiff["hasFish"] = False
+            elif snapshot is None:
+                statsValues.setTexts([
+                    "Waiting for camera",
+                    "-- | --",
+                    "-- x --",
+                    "--",
+                ])
+                fishStatsValues.setTexts(["--", "--", "--", "--"])
+                targetDiff["hasFish"] = False
+            else:
+                if imageSaver is not None:
+                    imageSaver.offer(snapshot.frame, snapshot.sequence)
+
+                frame = (
+                    snapshot.annotated_frame
+                    if snapshot.annotated_frame is not None
+                    else snapshot.frame
+                )
+
+                if frame is not None:
+                    try:
+                        surface = _numpy_bgr_to_surface(frame)
+                        imageView.setImage(surface)
+                        fishImageView.setImage(surface)
+                    except Exception:
+                        pass
+
+                best = snapshot.best
+                if best is None:
+                    statsValues.setTexts([
+                        "No fish detected",
+                        "-- | --",
+                        "-- x --",
+                        "--",
+                    ])
+                    fishStatsValues.setTexts(["--", "--", "--", "--"])
+                    targetDiff["hasFish"] = False
+                else:
+                    frameHeight, frameWidth = frame.shape[:2]
+                    centerX = frameWidth / 2.0
+                    centerY = frameHeight / 2.0
+                    fishX, fishY = best.center
+                    relativeX = fishX - centerX
+                    relativeY = fishY - centerY
+
+                    # Only move an axis when the fish is outside the deadband.
+                    targetX = (
+                        round(relativeX, 2)
+                        if abs(relativeX) > FISH_DEADBAND_PIXELS
+                        else 0.0
+                    )
+                    targetY = (
+                        round(relativeY, 2)
+                        if abs(relativeY) > FISH_DEADBAND_PIXELS
+                        else 0.0
+                    )
+
+                    targetDiff["x"] = targetX
+                    targetDiff["y"] = targetY
+                    targetDiff["hasFish"] = True
+
+                    statsValues.setTexts([
+                        f"Fish detected ({len(snapshot.detections)} total)",
+                        f"{relativeX:.1f} | {relativeY:.1f}",
+                        f"{best.width:.1f} x {best.height:.1f} px",
+                        f"{best.confidence:.3f}",
+                    ])
+                    fishStatsValues.setTexts([
+                        f"{relativeX:+.1f} px",
+                        f"{relativeY:+.1f} px",
+                        f"{targetX:+.1f}",
+                        f"{targetY:+.1f}",
+                    ])
+
+            calibration_state = bool(calibrationToggle.getValue())
+            if calibration_state != last_calibration_state:
+                last_calibration_state = calibration_state
+                if robot is None:
+                    executionState["status"] = "Robot not connected"
+                else:
+                    try:
+                        robot.write(
+                            CALIBRATION_DONE_VARIABLE,
+                            calibration_state,
+                        )
+                    except Exception as error:
+                        executionState["status"] = (
+                            f"Calibration write failed: {error}"
+                        )
+                    else:
+                        valueText = "true" if calibration_state else "false"
+                        executionState["status"] = (
+                            f"{CALIBRATION_DONE_VARIABLE} = {valueText}"
+                        )
+                        print(
+                            f"Sent: {CALIBRATION_DONE_VARIABLE} = {valueText}"
+                        )
+
+            if executionState["status"] != last_execute_status:
+                executeStatus.setText(executionState["status"])
+                last_execute_status = executionState["status"]
+
+            executeText = "Executing..." if executionState["running"] else "Execute"
+            if executeButton.getText() != executeText:
+                executeButton.setText(executeText)
 
             # Refresh the read rows once per second.
             if now - last_read_poll >= read_poll_interval:
@@ -452,29 +683,36 @@ def main():
 
                 last_read_poll = now
 
-            # Send only the diff sliders that changed since the last update.
-            # ThreadedRobotClient.write() is non-blocking and coalesces writes
-            # per name, so dragging cannot build up a backlog.
+            # Send only the diff sliders that changed since the last update,
+            # and only while the Controls tab is visible. Otherwise the
+            # sliders (usually 0) would overwrite values written by Execute on
+            # the Fish tab. ThreadedRobotClient.write() is non-blocking and
+            # coalesces writes per name, so dragging cannot build up a backlog.
             if robot is not None:
-                # A queued write may be dropped while the connection is down.
-                # After recovery, resend every setpoint once.
+                # Track recovery even while another tab is active, so switching
+                # back to Controls does not trigger a stale resend.
                 diff_error = robot.last_error
-                if last_diff_error is not None and diff_error is None:
-                    last_diff_values.clear()
+                recovered = last_diff_error is not None and diff_error is None
                 last_diff_error = diff_error
 
-                currentDiffValues = dict(
-                    zip(diffLabels, diffSliders.getValue())
-                )
-                for label, value in currentDiffValues.items():
-                    value = float(value)
-                    if last_diff_values.get(label) == value:
-                        continue
-                    try:
-                        robot.write(label, value)
-                        last_diff_values[label] = value
-                    except Exception as error:
-                        print(f"Error sending {label}: {error}")
+                if tabs.getActiveTab() == 0:
+                    # A queued write may be dropped while the connection is
+                    # down. After recovery, resend every setpoint once.
+                    if recovered:
+                        last_diff_values.clear()
+
+                    currentDiffValues = dict(
+                        zip(diffLabels, diffSliders.getValue())
+                    )
+                    for label, value in currentDiffValues.items():
+                        value = float(value)
+                        if last_diff_values.get(label) == value:
+                            continue
+                        try:
+                            robot.write(label, value)
+                            last_diff_values[label] = value
+                        except Exception as error:
+                            print(f"Error sending {label}: {error}")
 
             control.update()
     finally:

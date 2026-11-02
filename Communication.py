@@ -450,7 +450,12 @@ class RobotClient:
                     f"Failed to send command to {self.host}:{self.port}: {error}"
                 ) from error
 
-            response = parse_response(self._read_frame(sock))
+            try:
+                response = parse_response(self._read_frame(sock))
+            except RobotCommunicationError:
+                # Leave the next command a clean stream to work with.
+                self.close()
+                raise
             logger.debug("RX: %s", response.raw)
 
             if response.transaction_id != transaction_id:
@@ -883,12 +888,18 @@ class ThreadedRobotClient:
             for command in commands:
                 if stop.is_set():
                     break
-                self._client.send(
-                    MODE_WRITE,
-                    command.payload,
-                    transaction_id=command.transaction_id,
-                )
-                self._note_success()
+                try:
+                    self._client.send(
+                        MODE_WRITE,
+                        command.payload,
+                        transaction_id=command.transaction_id,
+                    )
+                except RobotCommunicationError as error:
+                    # A failure on one item must not silently drop the other
+                    # commands that were queued in the same batch.
+                    self._record_failure(error)
+                else:
+                    self._note_success()
         finally:
             with self._condition:
                 self._inflight = 0
