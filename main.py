@@ -42,7 +42,7 @@ CALIBRATION_DONE_VARIABLE = "g_calibrationDone"
 
 # Fish positions closer than this (in pixels from the frame centre) are treated
 # as already aligned and are sent as 0.
-FISH_DEADBAND_PIXELS = 10.0
+FISH_DEADBAND_PIXELS = 3.0
 EXECUTE_WAIT_SECONDS = 1.0
 
 
